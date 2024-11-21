@@ -44,6 +44,7 @@
 #include <ros/callback_queue.h>
 #include <sensor_msgs/Image.h>
 #include <image_transport/image_transport.h>
+#include <geometry_msgs/Twist.h>
 
 // OpenCV headers
 #include <opencv2/objdetect/objdetect.hpp>
@@ -91,6 +92,14 @@ protected:
   void publishDebugImage(cv::Mat& img,
                          const std::vector<cv::Rect>& detections) const;
 
+  float distance_to_maintain;
+  float linear_threshold;
+  float angular_threshold;
+  float img_width;
+  float time_to_x;
+  float time_to_angle;
+  float gain_linear_velocity;
+  float gain_angular_velocity;
   double _imageScaling;
   mutable cv_bridge::CvImage _cvImgDebug;
 
@@ -101,6 +110,7 @@ protected:
   ros::Time _imgTimeStamp;
 
   ros::Publisher _detectionPub;
+  ros::Publisher _velocityPub;
   image_transport::Publisher _imDebugPub;
 
 };
@@ -126,6 +136,16 @@ PersonDetector::PersonDetector(ros::NodeHandle& nh,
   _imDebugPub = _privateImageTransport.advertise("debug", 1);
 
   _detectionPub = _pnh.advertise<pal_detection_msgs::Detections2d>("detections", 1);
+  _velocityPub = _pnh.advertise<geometry_msgs::Twist>("cmd_vel", 1);
+
+  _pnh.getParam("distance_to_maintain_", distance_to_maintain);
+  _pnh.getParam("linear_threshold_", linear_threshold);
+  _pnh.getParam("angular_threshold_", angular_threshold);
+  _pnh.getParam("img_width_", img_width);
+  _pnh.getParam("time_to_x_", time_to_x);
+  _pnh.getParam("time_to_angle_", time_to_angle); 
+  _pnh.getParam("gain_angular_velocity_", gain_angular_velocity);
+  _pnh.getParam("gain_linear_velocity_", gain_linear_velocity);
 
   cv::namedWindow("person detections");
 }
@@ -163,6 +183,66 @@ void PersonDetector::imageCallback(const sensor_msgs::ImageConstPtr& msg)
                     static_cast<double>(cvImgPtr->image.cols)/static_cast<double>(img.cols),
                     static_cast<double>(cvImgPtr->image.rows)/static_cast<double>(img.rows));
   }
+
+  int x , y, width, height;
+  float distance;
+  float min_distance = 1.0;
+  float angle = 0.0;
+
+  if(detections.size() == 0)
+  {
+    geometry_msgs::Twist move_cmd;
+    move_cmd.linear.x = 0.0;
+    move_cmd.angular.z = 0.0;
+    _velocityPub.publish(move_cmd);
+    publishDetections(detections);
+    cv::Mat imDebug = cvImgPtr->image.clone();
+    publishDebugImage(imDebug, detections);
+    return;
+  }
+  //estimate distance for every detection and compute the min one
+  BOOST_FOREACH(const cv::Rect& roi, detections)
+  {
+    x = roi.x;
+    y = roi.y;
+    width  = roi.width;
+    height = roi.height;
+
+    distance = 600.0 / float(height);
+    // if (distance < min_distance)
+    if (true)
+    {
+      min_distance = distance;
+      angle = 0.01 * ((float)img_width/2 - x);
+      continue;
+    }
+
+    {
+    cv::rectangle(img, roi, CV_RGB(0,255,0), 2);
+    }
+  }
+
+  ROS_INFO_STREAM("min_distance: " << min_distance << " angle: " << angle);
+  geometry_msgs::Twist move_cmd;
+
+  move_cmd.linear.x = 0.0;
+  move_cmd.angular.z = 0.0;
+
+  if ((abs(min_distance - distance_to_maintain) > linear_threshold)
+          || (abs(angle) > angular_threshold))
+  {
+    auto linear_speed = gain_linear_velocity*(min_distance - distance_to_maintain) / time_to_x;
+    auto angular_speed = gain_angular_velocity*(angle / time_to_angle);
+    move_cmd.linear.x = linear_speed;
+    move_cmd.angular.z = angular_speed;
+  }
+  else
+  {
+    move_cmd.linear.x = 0.0;
+    move_cmd.angular.z = 0.0;
+  }
+
+  _velocityPub.publish(move_cmd);
 
   publishDetections(detections);
 
