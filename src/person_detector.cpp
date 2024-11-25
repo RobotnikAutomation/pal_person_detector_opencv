@@ -92,6 +92,8 @@ protected:
   void publishDebugImage(cv::Mat& img,
                          const std::vector<cv::Rect>& detections) const;
 
+  void pointCloudCallback(const sensor_msgs::PointCloud2ConstPtr& msg);
+
   float distance_to_maintain;
   float linear_threshold;
   float angular_threshold;
@@ -100,13 +102,19 @@ protected:
   float time_to_angle;
   float gain_linear_velocity;
   float gain_angular_velocity;
+  double hit_threshold;
+  double final_threshold;
   double _imageScaling;
+  bool use_mean_shift;
   mutable cv_bridge::CvImage _cvImgDebug;
+
+  int x , y, width, height;
 
   boost::scoped_ptr<cv::HOGDescriptor> _hogCPU;
 
   image_transport::ImageTransport _imageTransport, _privateImageTransport;
   image_transport::Subscriber _imageSub;
+  ros::Subscriber _depthSub;
   ros::Time _imgTimeStamp;
 
   ros::Publisher _detectionPub;
@@ -127,16 +135,19 @@ PersonDetector::PersonDetector(ros::NodeHandle& nh,
   _privateImageTransport(pnh)
 {  
 
-  _hogCPU.reset( new cv::HOGDescriptor );
+  _hogCPU.reset( new cv::HOGDescriptor ); 
+  // _hogCPU.reset( new cv::HOGDescriptor(cv::Size(48,96), cv::Size(16,16), cv::Size(8,8), cv::Size(8,8), 9, 1 )  );
   _hogCPU->setSVMDetector( cv::HOGDescriptor::getDefaultPeopleDetector() );
+  // _hogCPU->setSVMDetector( cv::HOGDescriptor::getDaimlerPeopleDetector() );
 
   image_transport::TransportHints transportHint(transport);
 
   _imageSub   = _imageTransport.subscribe(topic, 1, &PersonDetector::imageCallback, this, transportHint);
-  _imDebugPub = _privateImageTransport.advertise("debug", 1);
+  _depthSub = nh.subscribe("/robot/front_rgbd_camera/depth/color/points", 1, pointCloudCallback);
+  _imDebugPub = _privateImageTransport.advertise("debug", 10);
 
-  _detectionPub = _pnh.advertise<pal_detection_msgs::Detections2d>("detections", 1);
-  _velocityPub = _pnh.advertise<geometry_msgs::Twist>("cmd_vel", 1);
+  _detectionPub = _pnh.advertise<pal_detection_msgs::Detections2d>("detections", 10);
+  _velocityPub = _pnh.advertise<geometry_msgs::Twist>("Rcmd_vel", 10);
 
   _pnh.getParam("distance_to_maintain_", distance_to_maintain);
   _pnh.getParam("linear_threshold_", linear_threshold);
@@ -145,7 +156,10 @@ PersonDetector::PersonDetector(ros::NodeHandle& nh,
   _pnh.getParam("time_to_x_", time_to_x);
   _pnh.getParam("time_to_angle_", time_to_angle); 
   _pnh.getParam("gain_angular_velocity_", gain_angular_velocity);
-  _pnh.getParam("gain_linear_velocity_", gain_linear_velocity);
+  _pnh.getParam("gain_linear_velocity_", gain_linear_velocity); 
+  _pnh.getParam("hit_threshold_", hit_threshold);
+  _pnh.getParam("final_threshold_", final_threshold); 
+  _pnh.getParam("use_mean_shift_", use_mean_shift);
 
   cv::namedWindow("person detections");
 }
@@ -153,6 +167,13 @@ PersonDetector::PersonDetector(ros::NodeHandle& nh,
 PersonDetector::~PersonDetector()
 {
   cv::destroyWindow("person detections");
+}
+
+void PersonDetector::pointCloudCallback(const sensor_msgs::PointCloud2ConstPtr& msg)
+{
+  // Convert PointCloud2 to pcl::PointCloud
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  pcl::fromROSMsg(*msg, cloud);
 }
 
 void PersonDetector::imageCallback(const sensor_msgs::ImageConstPtr& msg)
@@ -184,7 +205,7 @@ void PersonDetector::imageCallback(const sensor_msgs::ImageConstPtr& msg)
                     static_cast<double>(cvImgPtr->image.rows)/static_cast<double>(img.rows));
   }
 
-  int x , y, width, height;
+  // int x , y, width, height;
   float distance;
   float min_distance = 1.0;
   float angle = 0.0;
@@ -213,16 +234,19 @@ void PersonDetector::imageCallback(const sensor_msgs::ImageConstPtr& msg)
     if (true)
     {
       min_distance = distance;
-      angle = 0.01 * ((float)img_width/2 - x);
+      angle = ((float)cvImgPtr->image.cols/2 - ((float)x + (float)width/2));
       continue;
     }
 
     {
     cv::rectangle(img, roi, CV_RGB(0,255,0), 2);
     }
+
+    ROS_INFO_STREAM("img_width: " << cvImgPtr->image.cols << "roi x: " << x << "roi width: " << width);
   }
 
-  ROS_INFO_STREAM("min_distance: " << min_distance << " angle: " << angle);
+  
+  // ROS_INFO_STREAM("min_distance: " << min_distance << " angle: " << angle);
   geometry_msgs::Twist move_cmd;
 
   move_cmd.linear.x = 0.0;
@@ -271,12 +295,12 @@ void PersonDetector::detectPersons(const cv::Mat& img,
 
   _hogCPU->detectMultiScale(img,
                             detections,
-                            0,                //hit threshold: decrease in order to increase number of detections but also false alarms
+                            hit_threshold,                //hit threshold: decrease in order to increase number of detections but also false alarms
                             cv::Size(8,8),    //win stride
                             cv::Size(0,0),    //padding 24,16
                             1.02,             //scaling
-                            1,                //final threshold
-                            false);            //use mean-shift to fuse detections
+                            final_threshold,                //final threshold
+                            use_mean_shift);            //use mean-shift to fuse detections
 
   double stop = static_cast<double>(cv::getTickCount());
   ROS_DEBUG_STREAM("Elapsed time in detectMultiScale: " << 1000.0*(stop-start)/cv::getTickFrequency() << " ms");
@@ -313,7 +337,7 @@ void PersonDetector::publishDebugImage(cv::Mat& img,
   }
 
   if ( img.channels() == 3 && img.depth() == CV_8U )
-    _cvImgDebug.encoding = sensor_msgs::image_encodings::BGR8;
+    _cvImgDebug.encoding = sensor_msgs::image_encodings::RGB8;
 
   else if ( img.channels() == 1 && img.depth() == CV_8U )
     _cvImgDebug.encoding = sensor_msgs::image_encodings::MONO8;

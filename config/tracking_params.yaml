@@ -4,5 +4,8 @@ angular_threshold_ : 0.1
 img_width_ : 500
 time_to_x_ : 1.0  
 time_to_angle_ : 1.0
-gain_angular_velocity_ : 0.4
-gain_linear_velocity_ : 2.0
+gain_angular_velocity_ : 0.0008
+gain_linear_velocity_ : 0.35
+hit_threshold_ : 0.8
+final_threshold_ : 1.0
+use_mean_shift_ : true

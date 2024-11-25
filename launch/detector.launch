@@ -11,7 +11,7 @@
     <param name="rate"  value="$(arg max_rate)"/>
     <param name="scale" value="$(arg scale)"/>
     <param name="transport" value="$(arg transport)"/>
-    <!-- <remap from="/person_detector/cmd_vel" to="/robot/move/cmd_vel"/> -->
+    <remap from="/person_detector/Rcmd_vel" to="/robot/move/cmd_vel"/>
   </node>
 
 </launch>
