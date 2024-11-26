@@ -45,6 +45,10 @@
 #include <sensor_msgs/Image.h>
 #include <image_transport/image_transport.h>
 #include <geometry_msgs/Twist.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <pcl_conversions/pcl_conversions.h>  // For pcl::fromROSMsg
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
 
 // OpenCV headers
 #include <opencv2/objdetect/objdetect.hpp>
@@ -94,6 +98,8 @@ protected:
 
   void pointCloudCallback(const sensor_msgs::PointCloud2ConstPtr& msg);
 
+  void publishVelocity(std::vector<cv::Rect>* detections, cv_bridge::CvImageConstPtr cvImgPtr, cv::Mat* img);
+
   float distance_to_maintain;
   float linear_threshold;
   float angular_threshold;
@@ -108,7 +114,10 @@ protected:
   bool use_mean_shift;
   mutable cv_bridge::CvImage _cvImgDebug;
 
-  int x , y, width, height;
+  int y_index , z_index;
+  int x_tracked , y_tracked;
+  float angular_speed;
+  float linear_speed;
 
   boost::scoped_ptr<cv::HOGDescriptor> _hogCPU;
 
@@ -143,7 +152,9 @@ PersonDetector::PersonDetector(ros::NodeHandle& nh,
   image_transport::TransportHints transportHint(transport);
 
   _imageSub   = _imageTransport.subscribe(topic, 1, &PersonDetector::imageCallback, this, transportHint);
-  _depthSub = nh.subscribe("/robot/front_rgbd_camera/depth/color/points", 1, pointCloudCallback);
+  _depthSub = _nh.subscribe("/robot/front_rgbd_camera/depth/color/points", 1, &PersonDetector::pointCloudCallback, this);
+  // subscriber_ = nh_.subscribe(pointcloud_topic_, 1, &PointCloudProcessor::pointCloudCallback, this);
+  // pnh_.subscribe<robotnik_msgs::ptz>(subscriber_rgb_command_topic_, 10, &Link750Camera::rgbCommandTopicSubCb, this);
   _imDebugPub = _privateImageTransport.advertise("debug", 10);
 
   _detectionPub = _pnh.advertise<pal_detection_msgs::Detections2d>("detections", 10);
@@ -162,6 +173,15 @@ PersonDetector::PersonDetector(ros::NodeHandle& nh,
   _pnh.getParam("use_mean_shift_", use_mean_shift);
 
   cv::namedWindow("person detections");
+
+  y_index = 0;
+  z_index = 0;
+
+  x_tracked = 0;
+  y_tracked = 0;
+
+  angular_speed = 0.0;
+  linear_speed = 0.0;
 }
 
 PersonDetector::~PersonDetector()
@@ -172,8 +192,24 @@ PersonDetector::~PersonDetector()
 void PersonDetector::pointCloudCallback(const sensor_msgs::PointCloud2ConstPtr& msg)
 {
   // Convert PointCloud2 to pcl::PointCloud
+  // ROS_INFO_STREAM("At least entered the callback");
   pcl::PointCloud<pcl::PointXYZ> cloud;
   pcl::fromROSMsg(*msg, cloud);
+
+  // ROS_INFO_STREAM("Received point with y_index: " << y_index << " and z_index: " << z_index);
+  
+
+  if (z_index*y_index >= cloud.width*cloud.height) 
+  {
+        // ROS_WARN("Coordinates out of bounds");
+        return;
+  }
+
+    // Compute the index based on z (column) and y (row) and retrieve the x value
+    int index = y_index * cloud.width + z_index;  // Adjust this based on the exact mapping in your point cloud
+    float x = cloud.points[index].x;
+
+    // ROS_INFO("Point at (y = %d, z = %d): x = %f", y_index, z_index, x);
 }
 
 void PersonDetector::imageCallback(const sensor_msgs::ImageConstPtr& msg)
@@ -205,73 +241,108 @@ void PersonDetector::imageCallback(const sensor_msgs::ImageConstPtr& msg)
                     static_cast<double>(cvImgPtr->image.rows)/static_cast<double>(img.rows));
   }
 
-  // int x , y, width, height;
+  publishVelocity(&detections, cvImgPtr, &img);
+
+  publishDetections(detections);
+
+  cv::Mat imDebug = cvImgPtr->image.clone();
+  publishDebugImage(imDebug, detections);
+}
+
+void PersonDetector::publishVelocity(std::vector<cv::Rect>* detections, cv_bridge::CvImageConstPtr cvImgPtr, cv::Mat* img)
+{
+  int x , y, width, height;
   float distance;
   float min_distance = 1.0;
   float angle = 0.0;
 
-  if(detections.size() == 0)
+  if(detections == nullptr)
   {
     geometry_msgs::Twist move_cmd;
     move_cmd.linear.x = 0.0;
     move_cmd.angular.z = 0.0;
     _velocityPub.publish(move_cmd);
-    publishDetections(detections);
-    cv::Mat imDebug = cvImgPtr->image.clone();
-    publishDebugImage(imDebug, detections);
     return;
   }
+
+  if(detections->size() == 0)
+  {
+    geometry_msgs::Twist move_cmd;
+    move_cmd.linear.x = 0.0;
+    move_cmd.angular.z = 0.0;
+    _velocityPub.publish(move_cmd);
+    publishDetections(*(detections));
+    cv::Mat imDebug = cvImgPtr->image.clone();
+    publishDebugImage(imDebug, *detections);
+    return;
+  }
+
+  x_tracked = static_cast<int>(cvImgPtr->image.cols/2);
+  y_tracked = static_cast<int>(cvImgPtr->image.rows/2);
+  float min_pixel_distance_to_tracked = sqrt(pow(cvImgPtr->image.cols, 2) + pow(cvImgPtr->image.rows, 2));
   //estimate distance for every detection and compute the min one
-  BOOST_FOREACH(const cv::Rect& roi, detections)
+  BOOST_FOREACH(const cv::Rect& roi, *detections)
   {
     x = roi.x;
     y = roi.y;
     width  = roi.width;
     height = roi.height;
 
+    y_index = - (x + (float)cvImgPtr->image.cols/2);
+    z_index = - (y + (float)cvImgPtr->image.rows/2);
+
     distance = 600.0 / float(height);
-    // if (distance < min_distance)
-    if (true)
+
+    float pixel_distance_to_tracked = sqrt(pow(x - x_tracked, 2) + pow(y - y_tracked, 2));
+    if(pixel_distance_to_tracked < min_pixel_distance_to_tracked)
     {
+      min_pixel_distance_to_tracked = pixel_distance_to_tracked;
+      x_tracked = x;
+      y_tracked = y;
       min_distance = distance;
-      angle = ((float)cvImgPtr->image.cols/2 - ((float)x + (float)width/2));
-      continue;
+      ROS_INFO_STREAM("Computed values: min_pixel_distance_to_tracked: " << min_pixel_distance_to_tracked);
     }
 
-    {
-    cv::rectangle(img, roi, CV_RGB(0,255,0), 2);
-    }
+    angle = ((float)cvImgPtr->image.cols/2 - ((float)x_tracked + (float)width/2));
+    
+    cv::rectangle(*img, roi, CV_RGB(0,255,0), 2);
 
     ROS_INFO_STREAM("img_width: " << cvImgPtr->image.cols << "roi x: " << x << "roi width: " << width);
   }
 
   
-  // ROS_INFO_STREAM("min_distance: " << min_distance << " angle: " << angle);
+  ROS_INFO_STREAM("min_distance: " << min_distance << " angle: " << angle);
   geometry_msgs::Twist move_cmd;
 
-  move_cmd.linear.x = 0.0;
-  move_cmd.angular.z = 0.0;
+  // move_cmd.linear.x = 0.0;
+  // move_cmd.angular.z = 0.0;
 
-  if ((abs(min_distance - distance_to_maintain) > linear_threshold)
-          || (abs(angle) > angular_threshold))
+  // when you want to rotate around itself
+  if (abs(angle) > angular_threshold && abs(min_distance - distance_to_maintain) <= linear_threshold)
   {
-    auto linear_speed = gain_linear_velocity*(min_distance - distance_to_maintain) / time_to_x;
-    auto angular_speed = gain_angular_velocity*(angle / time_to_angle);
-    move_cmd.linear.x = linear_speed;
-    move_cmd.angular.z = angular_speed;
+    linear_speed = 0;
+    angular_speed = gain_angular_velocity*(angle / time_to_angle);
   }
-  else
+
+  if(abs(min_distance - distance_to_maintain) <= linear_threshold)
   {
-    move_cmd.linear.x = 0.0;
-    move_cmd.angular.z = 0.0;
+    linear_speed = 0;
   }
+
+  if (abs(angle) < angular_threshold)
+  {
+    angular_speed = 0;
+  }
+  if (abs(min_distance - distance_to_maintain) > linear_threshold)
+  {
+    linear_speed = gain_linear_velocity*(min_distance - distance_to_maintain) / time_to_x;
+    angular_speed = gain_angular_velocity*(angle / time_to_angle);
+  }
+
+  move_cmd.linear.x = linear_speed;
+  move_cmd.angular.z = angular_speed;
 
   _velocityPub.publish(move_cmd);
-
-  publishDetections(detections);
-
-  cv::Mat imDebug = cvImgPtr->image.clone();
-  publishDebugImage(imDebug, detections);
 }
 
 void PersonDetector::scaleDetections(std::vector<cv::Rect>& detections,
